@@ -1,0 +1,12 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # 持久化 LAB_DATA_DIR（/app/data）：服务重启或容器被强制终止后，
+      # 已有实验仍按原 ID 恢复（已提交值与提交时间线同库持久化）
+      - lab-data:/app/data
+
+volumes:
+  lab-data:
