@@ -69,13 +69,30 @@
   恢复为该记录的 `before`，并按提交顺序追加一条 `side=system` 的补偿记录
   （`before`/`after` 对调、增量**逆序取负**、`compensates` 记原 seq；
   原记录保留，普通记录字段不变）。仅末条普通提交可补偿：**过期序号、
-  补偿记录或脚本有效期间返回 `409`**，补偿记录不可再补偿；`busy_timeout=0`，
+  补偿记录、转移记录或脚本有效期间返回 `409`**，补偿记录与转移记录都
+  不可再补偿；`busy_timeout=0`，
   两栏持写锁时立即返回 `SQLITE_BUSY` 错误名 / 错误码，**失败时回滚本事务，
   不改库也不改时间线**；目标核对与记录追加和普通提交的「COMMIT → 追加」
   在同一临界区互斥，交错时重新核对目标，**同一 seq 并发最多成功一次**。
   补偿不触碰两栏长期连接与 observer：两栏事务、只读模式、最近显式读值与
   读快照都不受影响（已有读快照仍见旧值），也不在两栏连接上额外读值；
   大整数沿用无损编码
+- **跨实验整数转移**（`POST /api/transfers`，body 为
+  `{"source": "<来源实验ID>", "target": "<目标实验ID>", "amount": N}`）：
+  来源减、目标加，返回两边新值与时间线序号。`amount` 为**正整数**，沿用
+  全站整数校验（JSON 整数或十进制字符串）与 **±2⁶²** 增量上限，大整数
+  无损。两个实验各用一条**全新的独立连接**真实操作（`busy_timeout=0`
+  显式事务，`UPDATE` 与记录 `INSERT` 同事务提交），**不触碰两栏事务、
+  只读模式、读快照与最近显式读值**。成功时两边各追加一条
+  `side=transfer` 的时间线记录（`before`/`after`、`deltas` 与连续 `seq`
+  沿用原格式），随值同事务落盘，**重启后仍可查询**；**转移记录不可补偿**
+  （补偿返回 `409`）。任一结果越过 64 位整数范围、写锁冲突或提交前失败，
+  **两库本次的值与记录都撤销**；写锁冲突立即返回 `SQLITE_BUSY` 错误名 /
+  错误码；两个 `COMMIT` 分开执行，不要求跨库崩溃原子性。与普通提交、
+  补偿及**反向转移**交错时记录对应真实提交顺序，不死锁；两实验均沿用
+  删除准入（删除先开始则 `410`，已准入转移先收尾再删，不阻塞其他实验）；
+  任一实验有有效脚本返回 `409`，未知 / 已删除 ID 沿用 `404` / `410`。
+  详见下文「示例九：跨实验整数转移」
 - 页面提供**删除当前实验**按钮（也可 HTTP 调用）：确认后删除。删除开始即等待
   此前已进入的请求正常完成，期间该实验的操作、状态、已提交值与检查点**新请求
   一律返回 410 Gone**；等待按实验独立，不阻塞其他实验。随后回滚两栏未提交事务、
@@ -775,6 +792,21 @@ python3 tests/backend_query.py
 node tests/workbench.test.js
 ```
 
+`tests/backend_transfer.py` 用同一个 stub 驱动实际路由，覆盖跨实验整数
+转移：来源减、目标加并返回两边新值与序号、两边各记 `side=transfer`
+（字段沿用原格式）、转移记录不可补偿（重启后仍不可补偿）、任一侧有效
+脚本 409、未知 / 已删除 ID 404 / 410、非法 body 与 amount（含相同 ID、
+超 ±2⁶² 上限）一律 400、来源 / 目标持写锁立即 `SQLITE_BUSY(5)` 且两库
+本次都撤销、任一结果越出 64 位范围两库都不修改、反向并发转移（20 轮）
+与和普通提交 / 补偿交错（各 20 轮）记录对应真实提交顺序且不死锁、
+大整数无损、两栏事务 / 只读 / 快照 / 最近读值不受影响、重启后转移记录
+仍可查询并继续编号、删除准入（`TransferGate` 把转移按在在途状态：
+删除等其收尾，等待期间其他实验照常）：
+
+```bash
+python3 tests/backend_transfer.py
+```
+
 ## 操作示例
 
 ### 示例一：快照隔离与快照冲突（SQLITE_BUSY_SNAPSHOT）
@@ -1282,6 +1314,125 @@ curl -s $BASE/committed                     # {"committed":100}
 > 补偿最多成功一次，后到者收到 `409`；脚本有效期间补偿同样返回 `409`。
 > 删除中的实验返回 `410`，未知实验返回 `404`（与其他接口一致）。
 
+### 示例九：跨实验整数转移（POST /api/transfers）
+
+> 在**两个实验**之间转移整数：来源减、目标加。两个实验各用一条**全新的
+> 独立连接**真实提交（`busy_timeout=0`），不触碰两栏事务、只读模式、读
+> 快照与最近显式读值；成功时两边各追加一条 `side=transfer` 的时间线记录
+> （重启后仍可查询，不可补偿）。任一结果越出 64 位范围、写锁冲突或提交前
+> 失败，**两库本次的值与记录都撤销**；两个 `COMMIT` 分开执行，不要求跨库
+> 崩溃原子性。
+
+#### 成功示例
+
+```bash
+SRC=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+DST=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 从 SRC 转 30 到 DST：返回两边新值与时间线序号
+curl -s -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$DST\",\"amount\":30}"
+# {"ok":true,"error":null,
+#  "source":{"id":"...","value":70,"seq":1},
+#  "target":{"id":"...","value":130,"seq":1}}
+
+# 两边时间线各追加一条 side=transfer 记录（before/after、deltas、连续 seq）
+curl -s http://localhost:8000/api/experiments/$SRC/timeline
+# {"timeline":[{"seq":1,"side":"transfer","before":100,"after":70,"deltas":[-30]}]}
+curl -s http://localhost:8000/api/experiments/$DST/timeline
+# {"timeline":[{"seq":1,"side":"transfer","before":100,"after":130,"deltas":[30]}]}
+
+# 大整数无损：amount 用十进制字符串，超出 ±2⁵³−1 的新值同样以字符串返回
+curl -s -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$DST\",\"amount\":\"9007199254741100\"}"
+# {"ok":true,...,"source":{"value":"-9007199254741030","seq":2},
+#  "target":{"value":"9007199254741230","seq":2}}
+
+# 转移记录不可补偿：409
+curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  http://localhost:8000/api/experiments/$DST/timeline/compensate \
+  -H 'Content-Type: application/json' -d '{"seq":2}'
+# 409
+
+# 非法请求：相同 ID / 非正数 / 超 ±2⁶² 上限 / 非整数 一律 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$SRC\",\"amount\":1}"        # 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$DST\",\"amount\":0}"         # 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$DST\",\"amount\":4611686018427387905}"  # 400
+```
+
+#### 目标持写锁示例（SQLITE_BUSY，两库都不变）
+
+```bash
+# 目标实验的乙栏：事务内 +7 不提交（持有写锁）
+curl -s -X POST http://localhost:8000/api/experiments/$DST/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$DST/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'
+
+# 转移立即失败：如实返回 SQLITE_BUSY(5)，两库的值与时间线都不变
+curl -s -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$DST\",\"amount\":10}"
+# {"ok":false,"error":{"name":"SQLITE_BUSY","code":5,
+#  "message":"database is locked"}}
+
+# 乙回滚释放写锁后，同一转移成功
+curl -s -X POST http://localhost:8000/api/experiments/$DST/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"rollback"}'
+curl -s -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$SRC\",\"target\":\"$DST\",\"amount\":10}"
+# {"ok":true,...}
+```
+
+> 来源持写锁时表现相同（立即 `SQLITE_BUSY(5)`，两库都不变）。任一结果
+> 越过有符号 64 位整数范围时返回 `ok:false`（错误名 / 码为 `null`，
+> 消息「转移结果超出有符号 64 位整数范围，两库均未修改」），两库同样
+> 都不修改。任一实验有有效脚本时返回 `409`；未知 / 已删除 ID 返回
+> `404` / `410`。
+
+#### 反向并发示例（A→B 与 B→A 同时转移）
+
+```bash
+A=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+B=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 两个方向并发：后端按固定顺序取两实验的锁，不死锁；两个都成功
+curl -s -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$A\",\"target\":\"$B\",\"amount\":3}" &
+curl -s -X POST http://localhost:8000/api/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"$B\",\"target\":\"$A\",\"amount\":7}" &
+wait
+# 两个都 {"ok":true,...}；净额 A：100-3+7=104，B：100+3-7=96
+
+# 两边时间线各两条 transfer 记录，顺序与真实提交顺序一致、链式衔接
+curl -s http://localhost:8000/api/experiments/$A/timeline
+# [{"seq":1,"side":"transfer","before":100,"after":97,"deltas":[-3]},
+#  {"seq":2,"side":"transfer","before":97,"after":104,"deltas":[7]}]
+curl -s http://localhost:8000/api/experiments/$B/timeline
+# [{"seq":1,"side":"transfer","before":100,"after":103,"deltas":[3]},
+#  {"seq":2,"side":"transfer","before":103,"after":96,"deltas":[-7]}]
+# （哪笔先提交取决于实际交错，但每条 before 必等于前一条 after，
+#  末条 after 必等于当前已提交值）
+```
+
+> 转移与普通提交、补偿并发交错时同样互斥：记录编号顺序与真实提交顺序
+> 严格一致。删除任一实验时，已准入的转移先收尾再删；删除先开始则转移
+> 返回 `410`；删除等待不阻塞其他实验。
 
 > 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；
 > 两栏的状态轮询与「已提交值」均通过独立连接 / 内存状态完成，

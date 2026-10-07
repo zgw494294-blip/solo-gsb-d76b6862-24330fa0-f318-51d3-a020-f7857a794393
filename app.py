@@ -55,6 +55,22 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 最近显式读值与读快照都不受影响（已有读快照仍见旧值），也不在两栏
 连接上额外读值。
 
+跨实验整数转移（POST /api/transfers，body 为不同的来源、目标实验 ID
+与正整数 amount）：来源减、目标加，返回两边新值与时间线序号。amount
+沿用 parse_int 整数校验、±2⁶² 增量上限与 json_int 无损传输。两个实验
+各用一条全新的独立连接真实操作（busy_timeout=0 的显式事务，UPDATE 与
+记录 INSERT 同事务提交），绝不触碰两栏长期连接与 observer：两栏事务、
+只读模式、读快照与最近显式读值都不受影响。成功时两边各追加一条
+side=transfer 的时间线记录（before/after、deltas 与连续 seq 沿用原
+格式），与值在同一事务落盘，重启后仍可查询；转移记录不可补偿（补偿
+一律 409）。任一结果越过有符号 64 位整数范围、写锁冲突或提交前失败，
+两库本次的值与记录都撤销（各自事务回滚）；写锁冲突立即返回 SQLite
+错误名 / 错误码；两个 COMMIT 分开执行，不要求跨库崩溃原子性。两个
+实验的 script_lock 与 timeline_lock 一律按实验 ID 排序获取，与普通
+提交、补偿及反向转移交错时记录对应真实提交顺序，不会死锁。两实验均
+沿用删除准入：删除先开始则拒绝（410），已准入转移先收尾再删，不阻塞
+其他实验；任一实验有有效脚本返回 409，未知 / 已删除 ID 沿用 404 / 410。
+
 删除实验（DELETE /api/experiments/<id>）先在内存门控上标记删除开始，
 并等待此前已进入的请求全部正常完成；删除开始后该实验的操作、状态、
 已提交值与检查点新请求一律返回 410。等待按实验独立，不阻塞其他实验。
@@ -165,6 +181,7 @@ MAX_ADD_ABS = 2 ** 62  # 单次增量上限
 INT64_MIN = -(2 ** 63)  # SQLite 整数下限，累加结果不得越界（含负向）
 INT64_MAX = 2 ** 63 - 1  # SQLite 整数上限，越界会被 SQLite 静默转成 REAL
 OVERFLOW_MESSAGE = "累加结果超出有符号 64 位整数范围，本次未修改"
+TRANSFER_OVERFLOW_MESSAGE = "转移结果超出有符号 64 位整数范围，两库均未修改"
 JS_SAFE_INT_MAX = 2 ** 53 - 1  # Number.MAX_SAFE_INTEGER，超出则用十进制字符串传输
 
 INT_PATTERN = re.compile(r"[+-]?[0-9]+")
@@ -1527,7 +1544,8 @@ def run_compensate(exp, seq):
     """补偿时间线末条普通提交，把已提交值恢复为该记录的 before。
 
     仅当末条记录是普通提交且 seq 与其一致时才执行；过期目标、补偿
-    （system）记录与有效脚本一律由调用方返回 409，补偿记录不可再补偿。
+    （system）记录、转移（transfer）记录与有效脚本一律由调用方返回
+    409，补偿记录与转移记录都不可再补偿。
     用一条全新的独立连接显式事务真实提交（UPDATE 与记录 INSERT 在同一
     事务，busy_timeout=0）：两栏任一事务持有写锁时立即返回 SQLITE_BUSY
     的错误名 / 错误码，失败时回滚本事务，不改库也不改时间线；进程任意
@@ -1557,6 +1575,11 @@ def run_compensate(exp, seq):
             if target["side"] == "system":
                 return None, {
                     "error": "compensation records cannot be compensated"
+                }
+            if target["side"] == "transfer":
+                # 转移记录不可补偿（与补偿记录一样一律 409）
+                return None, {
+                    "error": "transfer records cannot be compensated"
                 }
             # 补偿记录：before/after 对调（末条记录的 after 即当前已提交
             # 值——值的一切变化都有记录，且本临界区与普通提交互斥），
@@ -1611,6 +1634,159 @@ def run_compensate(exp, seq):
                 "record": timeline_public_view(record),
                 "timeline": exp._timeline_view_locked(),
             }, None
+
+
+class _TransferOverflow(Exception):
+    """转移结果越出 64 位整数范围：两库本次都不写入（内部控制流）。"""
+
+
+def _execute_transfer(src_exp, dst_exp, amount):
+    """在两条全新的独立连接上真实执行转移（调用方已持两实验的
+    script_lock 与 timeline_lock）。
+
+    读值、64 位边界判定、UPDATE 与时间线记录 INSERT 都在这两条连接上
+    完成，busy_timeout=0：写锁冲突立即报错。两个 COMMIT 之前的任何失败
+    （越界、写锁冲突、语句错误）都回滚两库事务：本次的值与记录都不留
+    痕迹。两个 COMMIT 分开执行，不要求跨库崩溃原子性；若来源已提交而
+    目标提交失败（实际不可达），来源已生效的记录如实补登内存后返回失败。
+    """
+    src_conn = sqlite3.connect(src_exp.db_path, timeout=0, isolation_level=None)
+    dst_conn = sqlite3.connect(dst_exp.db_path, timeout=0, isolation_level=None)
+    src_record = None
+    src_committed = False
+    try:
+        src_conn.execute("PRAGMA busy_timeout=0")
+        dst_conn.execute("PRAGMA busy_timeout=0")
+        try:
+            src_conn.execute("BEGIN")
+            dst_conn.execute("BEGIN")
+            # 在自己的连接、自己的事务内读两边现值：与两栏事务、读快照
+            # 无关；一切改值者（普通提交 / 补偿 / 转移）都经 timeline_lock
+            # 串行，读到的即最新已提交值
+            src_val = src_conn.execute(
+                "SELECT val FROM kv WHERE id = 1"
+            ).fetchone()[0]
+            dst_val = dst_conn.execute(
+                "SELECT val FROM kv WHERE id = 1"
+            ).fetchone()[0]
+            new_src = src_val - amount
+            new_dst = dst_val + amount
+            # 任一结果越出 64 位整数范围：两库都不写入（尚未执行任何
+            # UPDATE，回滚两事务即恢复原样），沿用拒绝响应（错误名 / 码
+            # 为 null）
+            if not (INT64_MIN <= new_src <= INT64_MAX) or not (
+                INT64_MIN <= new_dst <= INT64_MAX
+            ):
+                raise _TransferOverflow()
+            src_record = {
+                "seq": len(src_exp.timeline) + 1,
+                "side": "transfer",
+                "before": src_val,
+                "after": new_src,
+                "deltas": [-amount],
+            }
+            dst_record = {
+                "seq": len(dst_exp.timeline) + 1,
+                "side": "transfer",
+                "before": dst_val,
+                "after": new_dst,
+                "deltas": [amount],
+            }
+            # 值与记录在同一事务写入各自实验库：进程任意时刻终止，各库
+            # 只能恢复到二者都生效或都未生效的状态
+            src_conn.execute("UPDATE kv SET val = ? WHERE id = 1", (new_src,))
+            src_exp.insert_timeline_record(src_conn, src_record)
+            dst_conn.execute("UPDATE kv SET val = ? WHERE id = 1", (new_dst,))
+            dst_exp.insert_timeline_record(dst_conn, dst_record)
+            # 两个 COMMIT 分开执行：不要求跨库崩溃原子性
+            src_conn.execute("COMMIT")
+            src_committed = True
+            dst_conn.execute("COMMIT")
+        except _TransferOverflow:
+            for conn in (src_conn, dst_conn):
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            return {
+                "ok": False,
+                "error": {
+                    "name": None,
+                    "code": None,
+                    "message": TRANSFER_OVERFLOW_MESSAGE,
+                },
+            }
+        except sqlite3.Error as exc:
+            # 写锁冲突等：回滚两库未提交事务，本次的值与记录都撤销；
+            # 如实返回 SQLite 错误名 / 错误码
+            for conn in (src_conn, dst_conn):
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            if src_committed and src_record is not None:
+                # 来源已提交、目标提交失败（跨库原子性不要求）：来源
+                # 已生效的记录如实补登内存，与库中保持一致
+                src_exp.timeline.append(src_record)
+            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+            code = getattr(exc, "sqlite_errorcode", None)
+            return {
+                "ok": False,
+                "error": {"name": name, "code": code, "message": str(exc)},
+            }
+    finally:
+        src_conn.close()
+        dst_conn.close()
+    # 两边都已提交：把记录补登各自内存时间线（与库中同事务生效的记录
+    # 一致）；本临界区持有两实验 timeline_lock，编号顺序与真实提交
+    # 顺序严格一致
+    src_exp.timeline.append(src_record)
+    dst_exp.timeline.append(dst_record)
+    return {
+        "ok": True,
+        "error": None,
+        "source": {
+            "id": src_exp.id,
+            "value": json_int(src_record["after"]),
+            "seq": src_record["seq"],
+        },
+        "target": {
+            "id": dst_exp.id,
+            "value": json_int(dst_record["after"]),
+            "seq": dst_record["seq"],
+        },
+    }
+
+
+def run_transfer(src_exp, dst_exp, amount):
+    """在两个实验之间真实转移整数：来源减 amount、目标加 amount。
+
+    任一实验有有效脚本时由调用方返回 409。两个实验的 script_lock 与
+    timeline_lock 一律按实验 ID 排序获取：反向转移（A→B 与 B→A 并发）
+    及与普通提交、补偿交错时都按同一顺序取锁，不形成循环等待，记录
+    顺序与真实提交顺序一致。整个取锁与执行期间两实验的删除准入名额
+    由路由持有（已准入转移先收尾再删）。
+
+    返回 (result, conflict)：conflict 非 None 时调用方返回 409。
+    """
+    # 全局一致的加锁顺序（按实验 ID 排序），与方向无关：反向的两个
+    # 转移、转移与普通提交 / 补偿交错，都不会形成锁序环
+    if src_exp.id < dst_exp.id:
+        first, second = src_exp, dst_exp
+    else:
+        first, second = dst_exp, src_exp
+    with first.script_lock:
+        with second.script_lock:
+            if first._script_active_locked() or second._script_active_locked():
+                return None, {
+                    "error": "an active script exists on source or target; "
+                    "finish or cancel it before transferring"
+                }
+            with first.timeline_lock:
+                with second.timeline_lock:
+                    return _execute_transfer(src_exp, dst_exp, amount), None
 
 
 # 实验注册表：内存索引，启动时由 restore_experiments() 按数据目录中
@@ -1773,6 +1949,55 @@ def experiment_timeline_compensate(exp_id):
         return jsonify(result)
     finally:
         exp.finish_call()
+
+
+@app.post("/api/transfers")
+def create_transfer():
+    # 跨实验整数转移：来源减、目标加。body 必须是含不同的来源、目标
+    # 实验 ID 与正整数 amount 的 JSON 对象；amount 沿用 parse_int 整数
+    # 校验与 ±2⁶² 增量上限（大整数经十进制字符串传输）
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    source_id = data.get("source")
+    target_id = data.get("target")
+    if not isinstance(source_id, str) or not isinstance(target_id, str):
+        return (
+            jsonify({"error": "source and target must be experiment id strings"}),
+            400,
+        )
+    if source_id == target_id:
+        return (
+            jsonify({"error": "source and target must be different experiments"}),
+            400,
+        )
+    amount = parse_int(data.get("amount"))
+    if amount is None:
+        return jsonify({"error": "amount must be an integer"}), 400
+    if amount < 1:
+        return jsonify({"error": "amount must be a positive integer"}), 400
+    if amount > MAX_ADD_ABS:
+        return jsonify({"error": "amount too large"}), 400
+    # 两个实验都走删除准入：删除先开始则 410，已准入转移先收尾再删；
+    # 未知 ID 404。准入成功的名额在 finally 中归还
+    src_exp, response = admit_experiment(source_id)
+    if src_exp is None:
+        return response
+    try:
+        dst_exp, response = admit_experiment(target_id)
+        if dst_exp is None:
+            return response
+        try:
+            # 任一有有效脚本：409；写锁冲突 / 越界：200 + ok:false 并
+            # 如实携带错误名 / 错误码，两库本次的值与记录都撤销
+            result, conflict = run_transfer(src_exp, dst_exp, amount)
+            if conflict is not None:
+                return jsonify(conflict), 409
+            return jsonify(result)
+        finally:
+            dst_exp.finish_call()
+    finally:
+        src_exp.finish_call()
 
 
 def parse_script_action(data):
