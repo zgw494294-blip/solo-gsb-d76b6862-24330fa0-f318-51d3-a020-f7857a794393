@@ -416,7 +416,7 @@ function renderCheckpoint(state) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-const TIMELINE_SIDE_LABELS = { a: "甲（A）", b: "乙（B）", system: "系统" };
+const TIMELINE_SIDE_LABELS = { a: "甲（A）", b: "乙（B）", system: "系统", transfer: "转移" };
 
 function renderTimeline(records) {
   // 只渲染服务端内存中的提交时间线：轮询本身不读库、不触碰两栏连接

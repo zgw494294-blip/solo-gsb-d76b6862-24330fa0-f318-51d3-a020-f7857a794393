@@ -145,6 +145,39 @@ SQLITE_INTERRUPT）；**尚未开跑**（worker 尚未开始执行）的查询�
 事务、关闭连接、删除文件；查询不阻塞其他实验，失败或被取消的查询
 **不改值也不改时间线**。查询状态只保存在内存，服务重启后不恢复：
 旧查询 ID 对恢复后的实验返回 404，与「旧 ID 不影响新查询」一致。
+
+跨实验整数转移（POST /api/transfers，body 为
+{"source": <实验ID>, "target": <另一实验ID>, "amount": <正整数>}）：
+来源库减、目标库加，返回两边的 before/after、deltas 与各自时间线
+序号。amount 沿用增量上限（±2⁶²）、parse_int 整数校验（JSON 整数或
+十进制字符串，布尔 / 小数一律拒绝）与 json_int 无损传输；source 与
+target 必须是不同的现存实验 ID，未知 ID 返回 404、本次运行已删除 ID
+返回 410。任一实验存在有效（active）脚本一律 409，不执行、两库都不
+改。转移用**两条全新独立连接**（busy_timeout=0，不用两栏长期连接与
+observer）真实操作两库：两栏事务、只读模式、读快照与最近显式读值
+都不受影响（已有读快照仍见旧值），也不在两栏连接上额外读值。
+
+锁序按实验 ID 升序：先依次取两实验的 script_lock，再依次取
+timeline_lock，与普通提交（conn_lock → timeline_lock）、补偿
+（script_lock → timeline_lock）、脚本推进（script_lock → conn_lock
+→ timeline_lock）均不构成环，反向转移同序获取，绝不死锁。两库的值与
+记录在各自连接的显式事务中写入（每库内值与记录同事务），成功后才在
+各实验 timeline_lock 内按真实提交顺序追加 side=transfer 记录
+（before/after、deltas、连续 seq 沿用原格式：来源 deltas=[-amount]、
+目标 deltas=[amount]，无 compensates 字段），并与普通提交、补偿、
+反向转移交错时严格对应真实提交顺序。转移记录不可补偿（末条为转移
+记录时补偿返回 409），与值同库持久化，重启后仍可查询、编号接续；
+不要求跨库崩溃原子性（每库自身仍是值与记录同生共死）。
+
+任一结果越出有符号 64 位整数范围、写锁冲突（任一栏未提交事务持有
+该库写锁时立即 SQLITE_BUSY，错误名 / 码原样返回）或提交前任一语句
+失败：两库本次的值与记录全部撤销——尚未提交的一库直接回滚本事务；
+若第一库 COMMIT 已落盘后第二库 COMMIT 失败，则用另一条全新独立
+事务把已提交一库的值改回、并删除其本次转移记录（持锁期间无其他
+已提交写入交错），短暂受限重试后仍失败才返回 500。两实验都沿用删除
+准入：转移先在两实验 gate 各占一个在途名额，删除先开始则转移在
+准入处 410；已准入的转移先收尾（两库独立连接关闭、名额归还）删除
+才拆除，等待按实验独立，不阻塞其他实验。
 """
 
 import json
@@ -155,6 +188,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import ExitStack
 
 from flask import Flask, jsonify, render_template, request
 
@@ -1527,7 +1561,8 @@ def run_compensate(exp, seq):
     """补偿时间线末条普通提交，把已提交值恢复为该记录的 before。
 
     仅当末条记录是普通提交且 seq 与其一致时才执行；过期目标、补偿
-    （system）记录与有效脚本一律由调用方返回 409，补偿记录不可再补偿。
+    （system）记录、转移（transfer）记录与有效脚本一律由调用方返回 409，
+    补偿记录与转移记录都不可再补偿。
     用一条全新的独立连接显式事务真实提交（UPDATE 与记录 INSERT 在同一
     事务，busy_timeout=0）：两栏任一事务持有写锁时立即返回 SQLITE_BUSY
     的错误名 / 错误码，失败时回滚本事务，不改库也不改时间线；进程任意
@@ -1557,6 +1592,11 @@ def run_compensate(exp, seq):
             if target["side"] == "system":
                 return None, {
                     "error": "compensation records cannot be compensated"
+                }
+            if target["side"] == "transfer":
+                # 跨实验转移记录不可补偿（只能再发起一笔反向转移）
+                return None, {
+                    "error": "transfer records cannot be compensated"
                 }
             # 补偿记录：before/after 对调（末条记录的 after 即当前已提交
             # 值——值的一切变化都有记录，且本临界区与普通提交互斥），
@@ -1611,6 +1651,322 @@ def run_compensate(exp, seq):
                 "record": timeline_public_view(record),
                 "timeline": exp._timeline_view_locked(),
             }, None
+
+
+# ================= 跨实验整数转移 =================
+
+# 第一库已 COMMIT、第二库 COMMIT 失败时的「撤销已提交一库」受限重试：
+# 正常情况下本临界区持两库 timeline_lock，没有任何已提交写入会与撤销
+# 竞争；唯一可能的 SQLITE_BUSY 来自两栏仍未结束的旧写事务，它一旦
+# ROLLBACK/COMMIT 结束即可立即成功。总等待约 1 秒后仍失败才返回 500
+# （不要求跨库崩溃原子性：进程在此期间终止则只第一库生效）。
+TRANSFER_UNDO_ATTEMPTS = 50
+TRANSFER_UNDO_SLEEP = 0.02
+
+
+def open_transfer_connection(db_path):
+    """打开一条转移专用独立连接：与补偿连接同构（busy_timeout=0）。
+
+    不使用两栏长期连接与 observer，避免把转移与两栏事务、读快照、
+    最近显式读值绑定；自动提交模式，事务完全由显式 BEGIN/COMMIT/
+    ROLLBACK 控制，写锁冲突立即报错而不是等待。
+    """
+    conn = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    conn.execute("PRAGMA busy_timeout=0")
+    return conn
+
+
+def run_transfer(source, target, amount):
+    """在两个不同实验间真实执行一笔整数转移（来源减、目标加）。
+
+    锁序：按实验 ID 升序先依次取两实验 script_lock、再依次取
+    timeline_lock——与普通提交、补偿、脚本推进的锁序不构成环，反向
+    转移同序获取，绝不死锁。调用方必须已完成两实验的删除准入
+    （各占一个在途名额）与参数校验。
+
+    返回 (result, conflict, status)：
+    - conflict 非 None 时调用方以 (conflict, 409) 响应（任一实验存在
+      有效脚本）；
+    - status 非 None 时调用方以 (result, status) 响应（撤销最终失败，
+      仅理论可达的 500）；
+    - 其余 result 为常规响应：成功 ok:true；溢出 / 写锁冲突 / 提交前
+      失败为 200 + ok:false，两库的值与记录都保持原样。
+    """
+    # 升序排列两实验，保证锁获取顺序全局一致（无环）；按角色映射结果
+    ordered = sorted((source, target), key=lambda exp: exp.id)
+    low, high = ordered[0], ordered[1]
+
+    with ExitStack() as stack:
+        # 先 script_lock 后 timeline_lock，同一实验严格 script→timeline；
+        # 两实验间一律按 ID 升序：脚本推进（script→conn→timeline）、
+        # 补偿（script→timeline）与普通提交（conn→timeline）都不可能
+        # 与本序列构成等待环。
+        stack.enter_context(low.script_lock)
+        stack.enter_context(high.script_lock)
+        if low._script_active_locked() or high._script_active_locked():
+            return None, {
+                "error": "an active script exists in one of the experiments; "
+                "finish or cancel it before transferring"
+            }, None
+        stack.enter_context(low.timeline_lock)
+        stack.enter_context(high.timeline_lock)
+
+        def failure(error, side_views=None):
+            # 锁内构造视图：失败时两库本次值 / 记录都未生效，
+            # timeline 保持原样；seq 为 null（未追加记录）。
+            return {
+                "ok": False,
+                "error": error,
+                "source": (side_views or {}).get(source.id),
+                "target": (side_views or {}).get(target.id),
+                "timelines": {
+                    source.id: source._timeline_view_locked(),
+                    target.id: target._timeline_view_locked(),
+                },
+            }, None, None
+
+        def unchanged_view(exp, before):
+            # 失败视图：两库都未改（after == before），未追加记录
+            return {
+                "id": exp.id,
+                "before": json_int(before),
+                "after": json_int(before),
+                "deltas": [],
+                "seq": None,
+            }
+
+        # 两库各自的转移前已提交值：转移全程持 timeline_lock，普通提交 /
+        # 补偿 / 其他转移都无法在此期间改变已提交值，因此读到的值到本
+        # 事务 UPDATE 期间稳定；observer 不在两栏连接上读值，两栏的最近
+        # 显式读值与读快照不受影响。
+        src_before = source.committed_value()
+        dst_before = target.committed_value()
+        src_after = src_before - amount
+        dst_after = dst_before + amount
+
+        def side_view(exp, before, after, delta, seq):
+            return {
+                "id": exp.id,
+                "before": json_int(before),
+                "after": json_int(after),
+                "deltas": [json_int(delta)],
+                "seq": seq,
+            }
+
+        # 64 位边界：任一结果越界即拒绝（纯 Python 预判，不获取任何写锁、
+        # 不执行任何写语句），两库都不改。
+        if not (INT64_MIN <= src_after <= INT64_MAX
+                and INT64_MIN <= dst_after <= INT64_MAX):
+            views = {
+                source.id: unchanged_view(source, src_before),
+                target.id: unchanged_view(target, dst_before),
+            }
+            return failure(
+                {"name": None, "code": None, "message": OVERFLOW_MESSAGE},
+                views,
+            )
+
+        # 按升序构造两库的待写记录（seq 为各库自己的连续编号）
+        records = {}
+        befores = {source.id: src_before, target.id: dst_before}
+        afters = {source.id: src_after, target.id: dst_after}
+        deltas = {source.id: -amount, target.id: amount}
+        for exp in (low, high):
+            records[exp.id] = {
+                "seq": len(exp.timeline) + 1,
+                "side": "transfer",
+                "before": befores[exp.id],
+                "after": afters[exp.id],
+                "deltas": [deltas[exp.id]],
+            }
+
+        conns = {}
+        try:
+            for exp in (low, high):
+                conns[exp.id] = open_transfer_connection(exp.db_path)
+            # 先按升序完成两库全部写入（BEGIN/UPDATE/INSERT），任一语句
+            # 失败（写锁冲突 SQLITE_BUSY 等）两库都还没提交：回滚两库本
+            # 事务即可，库与时间线都保持原样。
+            failed_side = None
+            failed_error = None
+            for exp in (low, high):
+                conn = conns[exp.id]
+                try:
+                    conn.execute("BEGIN")
+                    conn.execute(
+                        "UPDATE kv SET val = ? WHERE id = 1",
+                        (afters[exp.id],),
+                    )
+                    exp.insert_timeline_record(conn, records[exp.id])
+                except sqlite3.Error as exc:
+                    failed_side = exp.id
+                    failed_error = exc
+                    break
+            if failed_error is not None:
+                # 回滚两库本次事务（失败库可能尚未 BEGIN / 已隐式回滚）
+                for exp in (low, high):
+                    conn = conns.get(exp.id)
+                    try:
+                        if conn is not None and conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                name = getattr(failed_error, "sqlite_errorname", None) \
+                    or "SQLITE_ERROR"
+                code = getattr(failed_error, "sqlite_errorcode", None)
+                views = {
+                    exp.id: unchanged_view(exp, befores[exp.id])
+                    for exp in (low, high)
+                }
+                return failure(
+                    {
+                        "name": name,
+                        "code": code,
+                        "message": str(failed_error),
+                        "failed_side": failed_side,
+                    },
+                    views,
+                )
+
+            # 两库写入都就绪：按升序逐个 COMMIT。COMMIT 失败的一库事务
+            # 未结束则回滚；若此前已有一库 COMMIT 落盘，必须把那一库本次
+            # 的值与记录一并撤销（持锁期间无其他已提交写入交错）。
+            committed = []
+            commit_error = None
+            commit_failed_side = None
+            for exp in (low, high):
+                conn = conns[exp.id]
+                try:
+                    conn.execute("COMMIT")
+                    committed.append(exp)
+                except sqlite3.Error as exc:
+                    commit_error = exc
+                    commit_failed_side = exp.id
+                    try:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    break
+
+            if commit_error is not None:
+                # 此前已提交的库按升序撤销（至多一个：第二库 COMMIT
+                # 失败时第一库已落盘；第一库失败时没有已提交库，回滚即可）
+                undo_failed = None
+                for done in committed:
+                    undo_error = _undo_committed_transfer(
+                        done, records[done.id]
+                    )
+                    if undo_error is not None:
+                        undo_failed = (done, undo_error)
+                        break
+                if undo_failed is not None:
+                    # 理论不可达的极端情况（写锁被未结束的两栏事务长期
+                    # 占住）：如实返回 500，由调用方如实上报。
+                    done, undo_error = undo_failed
+                    return {
+                        "ok": False,
+                        "error": {
+                            "name": "SQLITE_ERROR",
+                            "code": None,
+                            "message": "transfer partially committed and undo "
+                            "failed on experiment %s: %s"
+                            % (done.id, undo_error),
+                            "failed_side": commit_failed_side,
+                        },
+                        "committed": [exp.id for exp in committed],
+                        "timelines": {
+                            source.id: source._timeline_view_locked(),
+                            target.id: target._timeline_view_locked(),
+                        },
+                    }, None, 500
+                name = getattr(commit_error, "sqlite_errorname", None) \
+                    or "SQLITE_ERROR"
+                code = getattr(commit_error, "sqlite_errorcode", None)
+                views = {
+                    exp.id: unchanged_view(exp, befores[exp.id])
+                    for exp in (low, high)
+                }
+                return failure(
+                    {
+                        "name": name,
+                        "code": code,
+                        "message": str(commit_error),
+                        "failed_side": commit_failed_side,
+                    },
+                    views,
+                )
+        finally:
+            for conn in conns.values():
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+        # 两库 COMMIT 均已落盘：按真实提交顺序（升序）在各库内存时间线
+        # 追加同一记录，编号与库中记录一致。
+        for exp in (low, high):
+            exp.timeline.append(records[exp.id])
+
+        views = {
+            exp.id: side_view(
+                exp,
+                befores[exp.id],
+                afters[exp.id],
+                deltas[exp.id],
+                records[exp.id]["seq"],
+            )
+            for exp in (low, high)
+        }
+        return {
+            "ok": True,
+            "error": None,
+            "source": views[source.id],
+            "target": views[target.id],
+            "timelines": {
+                source.id: source._timeline_view_locked(),
+                target.id: target._timeline_view_locked(),
+            },
+        }, None, None
+
+
+def _undo_committed_transfer(exp, record):
+    """撤销已在一库落盘的本次转移：值改回 before、删除本次转移记录。
+
+    用一条全新独立连接的显式事务（busy_timeout=0）。调用方仍持有该库的
+    timeline_lock，持锁期间没有普通提交 / 补偿 / 其他转移改变已提交值，
+    因此直接改回 before 精确无损；唯一可能的 SQLITE_BUSY 来自两栏仍未
+    结束的旧写事务，在受限重试内等待其结束。内存时间线在撤销路径上
+    尚未追加（记录只在两库 COMMIT 都成功后才追加），无需改动内存。
+    返回 None 表示撤销成功；否则返回最后一次 sqlite3.Error。
+    """
+    last_error = None
+    for _ in range(TRANSFER_UNDO_ATTEMPTS):
+        conn = open_transfer_connection(exp.db_path)
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "UPDATE kv SET val = ? WHERE id = 1", (record["before"],)
+            )
+            conn.execute(
+                "DELETE FROM timeline WHERE seq = ?", (record["seq"],)
+            )
+            conn.execute("COMMIT")
+            return None
+        except sqlite3.Error as exc:
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            last_error = exc
+            time.sleep(TRANSFER_UNDO_SLEEP)
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    return last_error
 
 
 # 实验注册表：内存索引，启动时由 restore_experiments() 按数据目录中
@@ -1684,6 +2040,58 @@ def create_experiment():
         # 全新 ID，不会与已删除集合冲突；保险起见若被复用则移除旧墓碑
         deleted_experiments.discard(exp_id)
     return jsonify({"id": exp_id})
+
+
+@app.post("/api/transfers")
+def create_transfer():
+    """跨实验整数转移：来源减、目标加，返回两边新值与各自时间线序号。
+
+    仅扩展 HTTP 能力：不触碰两栏长期连接与 observer，旧接口不变。
+    body 为 {"source": <实验ID>, "target": <另一实验ID>,
+    "amount": <正整数>}；参数非法 400，未知 ID 404 / 已删除 ID 410，
+    任一实验有有效脚本 409；写锁冲突 / 越界 / 提交前失败为 200 +
+    ok:false 并如实携带 SQLite 错误名 / 码（越界名称 / 码为 null），
+    两库本次的值与记录全部撤销。
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    source_id = data.get("source")
+    target_id = data.get("target")
+    if not isinstance(source_id, str) or not isinstance(target_id, str):
+        return (
+            jsonify({"error": "source and target must be experiment id strings"}),
+            400,
+        )
+    if source_id == target_id:
+        return jsonify({"error": "source and target must be different experiments"}), 400
+    # 正整数 amount：沿用 parse_int（JSON 整数或十进制字符串；布尔 /
+    # 小数 / None 拒绝）、±2⁶² 单次增量上限与大整数无损约定
+    amount = parse_int(data.get("amount"))
+    if amount is None or amount <= 0:
+        return jsonify({"error": "amount must be a positive integer"}), 400
+    if amount > MAX_ADD_ABS:
+        return jsonify({"error": "amount too large"}), 400
+    # 两实验分别占一个删除准入门控名额：删除先开始的一侧在此即 410；
+    # 已准入的转移先在两实验门控内收尾，删除才会拆除连接与文件。
+    source, source_gone = admit_experiment(source_id)
+    if source is None:
+        return source_gone
+    try:
+        target, target_gone = admit_experiment(target_id)
+        if target is None:
+            return target_gone
+        try:
+            result, conflict, failed_status = run_transfer(source, target, amount)
+            if conflict is not None:
+                return jsonify(conflict), 409
+            if failed_status is not None:
+                return jsonify(result), failed_status
+            return jsonify(result)
+        finally:
+            target.finish_call()
+    finally:
+        source.finish_call()
 
 
 @app.delete("/api/experiments/<exp_id>")
